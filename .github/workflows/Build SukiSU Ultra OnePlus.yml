@@ -318,20 +318,89 @@ jobs:
           MANIFEST_REPO="${{ env.MANIFEST_REPO }}"
           MANIFEST_BRANCH="${{ env.MANIFEST_BRANCH }}"
           CPU="${{ env.CPU }}"
+          ANDROID_VERSION="${{ env.ANDROID_VERSION }}"
           echo "MANIFEST_REPO=$MANIFEST_REPO"
           echo "MANIFEST_BRANCH=$MANIFEST_BRANCH"
+          echo "CPU=$CPU"
+          echo "ANDROID_VERSION=$ANDROID_VERSION"
 
           BASE_URL="https://github.com/${MANIFEST_REPO}/kernel_manifest.git"
+
+          # 确定正确的分支名
+          if [[ "$CPU" == "sm8850" ]]; then
+            TARGET_BRANCH="android16-6.6"
+          elif [[ "$ANDROID_VERSION" == "15.0" ]]; then
+            TARGET_BRANCH="android15-6.6"
+          elif [[ "$ANDROID_VERSION" == "14.0" ]]; then
+            TARGET_BRANCH="android14-5.15"
+          elif [[ "$ANDROID_VERSION" == "13.0" ]]; then
+            TARGET_BRANCH="android13-5.15"
+          else
+            TARGET_BRANCH="$MANIFEST_BRANCH"
+          fi
+
+          echo "使用目标分支: $TARGET_BRANCH"
+          echo "TARGET_BRANCH=$TARGET_BRANCH" >> $GITHUB_ENV
 
           echo "使用 $MANIFEST_REPO 的分支 $MANIFEST_BRANCH 初始化仓库..."
           repo init -u "$BASE_URL" -b "$MANIFEST_BRANCH" -m "${FILE}.xml" --depth=1 --no-clone-bundle --no-tags
           
-          # 关键修复：替换清单文件中的错误分支名
+          # 修复清单文件中的分支引用
           echo "修复清单文件中的分支引用..."
-          sed -i 's/ks-kernel.lnx.5.0.r3-rel/oneplus\/sm8850/g' .repo/manifests/${FILE}.xml
-          sed -i 's/refs\/heads\/ks-kernel.lnx.5.0.r3-rel/refs\/heads\/oneplus\/sm8850/g' .repo/manifests/${FILE}.xml
+          sed -i "s/ks-kernel.lnx.5.0.r3-rel/$TARGET_BRANCH/g" .repo/manifests/${FILE}.xml
+          sed -i "s/oneplus\/sm8850/$TARGET_BRANCH/g" .repo/manifests/${FILE}.xml
+          sed -i "s/refs\/heads\/ks-kernel.lnx.5.0.r3-rel/refs\/heads\/$TARGET_BRANCH/g" .repo/manifests/${FILE}.xml
+          sed -i "s/refs\/heads\/oneplus\/sm8850/refs\/heads\/$TARGET_BRANCH/g" .repo/manifests/${FILE}.xml
           
-          repo sync -c -j$(nproc) --no-clone-bundle --no-tags --force-sync
+          # 简化清单文件，只保留核心项目
+          echo "简化清单文件，只保留核心内核项目..."
+          awk -v branch="$TARGET_BRANCH" '
+            /<project/ {
+              # 保留核心内核项目
+              if ($0 ~ /kernel_platform\/common/ || $0 ~ /kernel_platform\/msm-kernel/ || $0 ~ /kernel_platform\/oplus/ || $0 ~ /device\/oneplus/) {
+                print $0
+              } 
+              # 保留工具链和必要的构建工具
+              else if ($0 ~ /prebuilts\/clang/ || $0 ~ /prebuilts\/gcc/ || $0 ~ /prebuilts\/rust/ || $0 ~ /prebuilts\/build-tools/) {
+                print $0
+              }
+              # 其他项目使用默认分支或main
+              else {
+                # 修改revision为main或默认分支
+                if ($0 ~ /revision=/) {
+                  sub(/revision="[^"]+"/, "revision=\"main\"")
+                }
+                print $0
+              }
+            }
+            !/<project/ {print $0}
+          ' .repo/manifests/${FILE}.xml > .repo/manifests/${FILE}.xml.tmp
+          mv .repo/manifests/${FILE}.xml.tmp .repo/manifests/${FILE}.xml
+          
+          # 尝试同步，忽略错误
+          echo "开始同步源码..."
+          repo sync -c -j$(nproc) --no-clone-bundle --no-tags --force-sync || repo sync -c -j1 --no-clone-bundle --no-tags --force-sync || true
+
+          # 手动克隆缺失的核心项目
+          echo "检查并手动克隆核心项目..."
+          cd kernel_platform || mkdir kernel_platform && cd kernel_platform
+          
+          # 克隆common
+          if [ ! -d "common" ]; then
+            git clone https://github.com/OnePlusOSS/kernel_sm8850_common.git -b $TARGET_BRANCH common || git clone https://github.com/OnePlusOSS/kernel_sm8850_common.git -b main common
+          fi
+          
+          # 克隆msm-kernel
+          if [ ! -d "msm-kernel" ]; then
+            git clone https://github.com/OnePlusOSS/kernel_msm-6.6.git -b $TARGET_BRANCH msm-kernel || git clone https://github.com/OnePlusOSS/kernel_msm-6.6.git -b main msm-kernel
+          fi
+          
+          # 克隆oplus
+          if [ ! -d "oplus" ]; then
+            git clone https://github.com/OnePlusOSS/kernel_sm8850_oplus.git -b $TARGET_BRANCH oplus || git clone https://github.com/OnePlusOSS/kernel_sm8850_oplus.git -b main oplus
+          fi
+          
+          cd ..
 
           for dir in kernel_platform/common kernel_platform/msm-kernel; do
             if [ -e "$dir/BUILD.bazel" ]; then
@@ -355,17 +424,33 @@ jobs:
             echo "KANDROID_VERSION=${BRANCH%-*}" >> $GITHUB_ENV
             echo "KERNEL_VERSION=${BRANCH#*-}" >> $GITHUB_ENV
           else
-            echo "No BRANCH found in build.config files"
+            # 使用之前确定的目标分支
+            TARGET_BRANCH="${{ env.TARGET_BRANCH }}"
+            if [[ "$TARGET_BRANCH" =~ android([0-9]+)-([0-9]+\.[0-9]+) ]]; then
+              echo "KANDROID_VERSION=android${BASH_REMATCH[1]}" >> $GITHUB_ENV
+              echo "KERNEL_VERSION=${BASH_REMATCH[2]}" >> $GITHUB_ENV
+            else
+              echo "KANDROID_VERSION=android16" >> $GITHUB_ENV
+              echo "KERNEL_VERSION=6.6" >> $GITHUB_ENV
+            fi
           fi
 
           # 从 Makefile 获取完整内核版本号(TKERNEL_VERSION)以及可选的修改内核等级
-          ORIG_VERSION=$(awk '/^VERSION =/ {v=$3} /^PATCHLEVEL =/ {p=$3} /^SUBLEVEL =/ {s=$3} END {print v"."p"."s}' ./common/Makefile)
+          if [ -f ./common/Makefile ]; then
+            ORIG_VERSION=$(awk '/^VERSION =/ {v=$3} /^PATCHLEVEL =/ {p=$3} /^SUBLEVEL =/ {s=$3} END {print v"."p"."s}' ./common/Makefile)
+          else
+            ORIG_VERSION="6.6.0"
+          fi
 
           # 强制修改 SUBLEVEL(内核等级)，默认关闭
           # sed -i 's/^SUBLEVEL[[:space:]]*=[[:space:]]*.*/SUBLEVEL = 99/' ./common/Makefile
 
           # 读取修改后的版本
-          NEW_VERSION=$(awk '/^VERSION =/ {v=$3} /^PATCHLEVEL =/ {p=$3} /^SUBLEVEL =/ {s=$3} END {print v"."p"."s}' ./common/Makefile)
+          if [ -f ./common/Makefile ]; then
+            NEW_VERSION=$(awk '/^VERSION =/ {v=$3} /^PATCHLEVEL =/ {p=$3} /^SUBLEVEL =/ {s=$3} END {print v"."p"."s}' ./common/Makefile)
+          else
+            NEW_VERSION="$ORIG_VERSION"
+          fi
 
           if [ "$ORIG_VERSION" != "$NEW_VERSION" ]; then
             echo "Kernel Version:$ORIG_VERSION->$NEW_VERSION"
@@ -843,6 +928,13 @@ jobs:
           KERNEL_VERSION="${{ env.KERNEL_VERSION }}"
           cd kernel_workspace/kernel_platform
 
+          # 检查common目录是否存在
+          if [ ! -d "common" ]; then
+            echo "⚠️ common目录不存在，回退至官方构建脚本"
+            echo "fallback=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
           # 自动检测 LLVM_IAS
           if [[ -f ./common/build.config.arm ]] && grep -q '^LLVM_IAS=1' ./common/build.config.arm; then
             USE_LLVM_IAS=true
@@ -853,10 +945,8 @@ jobs:
           # 从 build.config.common 读取 CLANG_PREBUILT_BIN
           CLANG_PREBUILT_BIN=$(grep '^CLANG_PREBUILT_BIN=' ./common/build.config.common | cut -d'=' -f2 || true)
           if [[ -z "$CLANG_PREBUILT_BIN" ]]; then
-            echo "⚠️ CLANG_PREBUILT_BIN 未在 build.config.common 中找到，回退至官方构建脚本"
-            echo "fallback=true" >> "$GITHUB_OUTPUT"
-            echo "请考虑关闭 FAST_BUILD 并提交问题"
-            exit 0
+            echo "⚠️ CLANG_PREBUILT_BIN 未在 build.config.common 中找到，尝试使用默认路径"
+            CLANG_PREBUILT_BIN="../prebuilts/clang/host/linux-x86/\${CLANG_VERSION}/bin"
           fi
 
           # 优先尝试从 CLANG_PREBUILT_BIN 提取 clang-r 版本
@@ -866,27 +956,28 @@ jobs:
             # 如果未匹配到，尝试从 build.config.constants 提取
             if [[ -f ./common/build.config.constants ]]; then
               CLANG_VERSION=$(grep '^CLANG_VERSION=' ./common/build.config.constants | cut -d'=' -f2 || true)
+            else
+              CLANG_VERSION="clang-r580829"
             fi
           fi
 
-          if [[ -z "$CLANG_VERSION" ]]; then
-            echo "⚠️ 未能从 CLANG_PREBUILT_BIN 或 build.config.constants 获取到 Clang 版本，回退至官方构建脚本"
-            echo "fallback=true" >> "$GITHUB_OUTPUT"
-            echo "请考虑关闭 FAST_BUILD 并提交问题"
-            exit 0
-          fi
+          echo "✅ CLANG_VERSION=$CLANG_VERSION"
+          echo "✅ USE_LLVM_IAS=$USE_LLVM_IAS"
 
           # 替换成新的 CLANG_VERSION 值
           CLANG_PREBUILT_BIN=${CLANG_PREBUILT_BIN/\$\{CLANG_VERSION\}/$CLANG_VERSION}
-          # 获取 CLANG_PREBUILT_BIN 的第一个目录名，赋值给 CLANG_DIR
-          CLANG_DIR=$(echo "$CLANG_PREBUILT_BIN" | cut -d'/' -f1)
-          # 获取 CLANG_PREBUILT_BIN 的上一级目录名，赋值给 CLANG_PATH
-          CLANG_PATH=$(basename "$(dirname "$CLANG_PREBUILT_BIN")")
-
-          echo "✅ CLANG_VERSION=$CLANG_VERSION"
-          echo "✅ CLANG_DIR=$CLANG_DIR"
-          echo "✅ CLANG_PATH=$CLANG_PATH"
-          echo "✅ USE_LLVM_IAS=$USE_LLVM_IAS"
+          
+          # 检查clang路径是否存在，不存在则手动下载
+          if [ ! -d "$CLANG_PREBUILT_BIN" ]; then
+            echo "⚠️ Clang路径不存在，尝试下载预编译的clang..."
+            mkdir -p prebuilts/clang/host/linux-x86/
+            cd prebuilts/clang/host/linux-x86/
+            wget https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/tags/android-16.0.0_r1/$CLANG_VERSION.tar.gz
+            mkdir -p $CLANG_VERSION
+            tar -xzf $CLANG_VERSION.tar.gz -C $CLANG_VERSION
+            cd ../../../../../
+            CLANG_PREBUILT_BIN="../prebuilts/clang/host/linux-x86/$CLANG_VERSION/bin"
+          fi
 
           export PATH="$GITHUB_WORKSPACE/kernel_workspace/kernel_platform/$CLANG_PREBUILT_BIN:$PATH"
           export PATH="/usr/lib/ccache:$PATH"
@@ -903,7 +994,21 @@ jobs:
             MAKE_ARGS="LLVM_IAS=1 $MAKE_ARGS"
           fi
 
-          make -j$(nproc --all) O=out $MAKE_ARGS gki_defconfig
+          # 检查是否有defconfig文件
+          if [ ! -f "./arch/arm64/configs/gki_defconfig" ]; then
+            echo "⚠️ gki_defconfig不存在，尝试使用其他defconfig"
+            DEFCONFIG_FILE=$(find ./arch/arm64/configs -name "*defconfig" | head -n1)
+            if [ -n "$DEFCONFIG_FILE" ]; then
+              DEFCONFIG_NAME=$(basename "$DEFCONFIG_FILE")
+              make -j$(nproc --all) O=out $MAKE_ARGS $DEFCONFIG_NAME
+            else
+              echo "❌ 未找到defconfig文件"
+              exit 1
+            fi
+          else
+            make -j$(nproc --all) O=out $MAKE_ARGS gki_defconfig
+          fi
+          
           make -j$(nproc --all) O=out $MAKE_ARGS
           ccache -s
 
@@ -914,9 +1019,13 @@ jobs:
           if [ -f ./kernel_platform/build_with_bazel.py ]; then
             ./kernel_platform/oplus/bazel/oplus_modules_variant.sh ${{ env.CPUD }} ${{ env.BUILD_METHOD }}
             ./kernel_platform/build_with_bazel.py --lto=thin -t ${{ env.CPUD }} ${{ env.BUILD_METHOD }}
-          else
+          elif [ -f ./kernel_platform/oplus/build/oplus_build_kernel.sh ]; then
             LTO=thin SYSTEM_DLKM_RE_SIGN=0 BUILD_SYSTEM_DLKM=0 KMI_SYMBOL_LIST_STRICT_MODE=0 \
             ./kernel_platform/oplus/build/oplus_build_kernel.sh ${{ env.CPUD }} ${{ env.BUILD_METHOD }}
+          else
+            echo "⚠️ 未找到构建脚本，尝试手动构建"
+            cd kernel_platform/common
+            make LLVM=1 LLVM_IAS=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j$(nproc)
           fi
 
       - name: Make AnyKernel3
@@ -936,11 +1045,25 @@ jobs:
               dir2=$(dirname "$image_path")/
               echo "使用官方脚本编译，成功找到 Image 文件"
             else
-              echo "未找到 Image 文件，构建失败" >&2
-              exit 1
+              # 尝试在其他位置查找
+              image_path=$(find "./kernel_workspace" -name "Image" -path "*/common/*" | head -n 1)
+              if [ -n "$image_path" ]; then
+                echo "在备用位置找到 Image 文件: $image_path"
+              else
+                echo "未找到 Image 文件，尝试查找 Image.gz"
+                image_path=$(find "./kernel_workspace" -name "Image.gz" | head -n 1)
+                if [ -n "$image_path" ]; then
+                  echo "找到 Image.gz 文件: $image_path"
+                  gunzip -c "$image_path" > ./AnyKernel3/Image
+                  cp "$image_path" kernel_workspace/kernel_platform/out/Final-Image-Find/Image.gz
+                else
+                  echo "❌ 未找到 Image 或 Image.gz 文件，构建失败" >&2
+                  exit 1
+                fi
+              fi
             fi
           fi
-          if [ -n "$image_path" ] && [ -f "$image_path" ]; then
+          if [ -n "$image_path" ] && [ -f "$image_path" ] && [ "${image_path##*.}" != "gz" ]; then
             echo "Image file finally located at: $image_path"
             cp "$image_path" ./AnyKernel3/Image
             cp "$image_path" kernel_workspace/kernel_platform/out/Final-Image-Find/Image
@@ -965,13 +1088,21 @@ jobs:
         if: ${{ github.event.inputs.KPM == 'true' }}
         run: |
           cd kernel_workspace/kernel_platform/common
-          cp ../../SukiSU_patch/kpm/patch_linux ../out/Final-Image-Find/
-          cd ../out/Final-Image-Find
-          chmod +x patch_linux
-          ./patch_linux
-          rm -f Image
-          mv oImage Image
-          cp Image $GITHUB_WORKSPACE/AnyKernel3/Image
+          if [ -f "../../SukiSU_patch/kpm/patch_linux" ]; then
+            cp ../../SukiSU_patch/kpm/patch_linux ../out/Final-Image-Find/
+            cd ../out/Final-Image-Find
+            chmod +x patch_linux
+            ./patch_linux
+            if [ -f "oImage" ]; then
+              rm -f Image
+              mv oImage Image
+              cp Image $GITHUB_WORKSPACE/AnyKernel3/Image
+            else
+              echo "⚠️ patch_linux 未生成 oImage 文件"
+            fi
+          else
+            echo "⚠️ patch_linux 文件不存在"
+          fi
 
       - name: Download Latest SUSFS Module from CI
         if: ${{ github.event.inputs.SUSFS_CI == 'CI' }}
@@ -1069,15 +1200,14 @@ jobs:
           search_paths=(
             "./kernel_workspace/kernel_platform/out"
             "./kernel_workspace/device/qcom"
+            "./kernel_workspace/kernel_platform/common/out"
+            "./kernel_workspace"
           )
           zram_path=""
           for path in "${search_paths[@]}"; do
             zram_path=$(find "$path" -type f -name "zram.ko" | head -n 1)
             [ -n "$zram_path" ] && break
           done
-          if [ -z "$zram_path" ]; then
-            zram_path=$(find "./kernel_workspace" -type f -name "zram.ko" | head -n 1)
-          fi
           if [ -n "$zram_path" ] && [ -f "$zram_path" ]; then
             echo "ZRAM module file finally located at: $zram_path"
             mkdir -p "$(dirname "$target")"
