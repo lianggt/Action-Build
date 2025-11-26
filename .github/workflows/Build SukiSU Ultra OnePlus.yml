@@ -283,27 +283,75 @@ jobs:
           path: ${{ env.CCACHE_DIR }}
           key: ccache-${{ runner.os }}-${{ github.ref_name }}-${{ github.event.inputs.FILE }}-${{ env.BUILD_METHOD }}-${{ github.event.inputs.FAST_BUILD == 'true' && 'alpha' || 'beta' }}-16
 
-- name: Initialize Repo and Sync
-  run: |
-    mkdir kernel_workspace && cd kernel_workspace
-    mkdir -p .repo/manifests
-    cp "$GITHUB_WORKSPACE/.repo/manifests_fallback/${FILE}.xml" ".repo/manifests/${FILE}.xml"
-    
-    MANIFEST_REPO="OnePlusOSS"
-    MANIFEST_BRANCH="oneplus/sm8850"
-    CPU="sm8850"
-    echo "MANIFEST_REPO=$MANIFEST_REPO"
-    echo "MANIFEST_BRANCH=$MANIFEST_BRANCH"
-    
-    BASE_URL="https://github.com/${MANIFEST_REPO}/kernel_manifest.git"
-    
-    echo "使用 $MANIFEST_REPO 的分支 $MANIFEST_BRANCH 初始化仓库..."
-    repo init -u "$BASE_URL" -b "$MANIFEST_BRANCH" -m "${FILE}.xml" --depth=1 --no-clone-bundle --no-tags
-    
-    # 关键添加：替换清单文件中的错误分支名
-    sed -i 's/ks-kernel.lnx.5.0.r3-rel/oneplus\/sm8850/g' .repo/manifests/${FILE}.xml
-    
-    repo sync -c -j$(nproc) --no-clone-bundle --no-tags --force-sync
+      - name: Initialize Ccache
+        run: |
+          INIT_FLAG="${{ env.CCACHE_DIR }}/.ccache_initialized"
+          if command -v ccache >/dev/null 2>&1; then
+            if [ ! -f "$INIT_FLAG" ]; then
+              echo "初始化 ccache (${{ env.CCACHE_DIR }})..."
+              mkdir -p "${{ env.CCACHE_DIR }}"
+              ccache -M ${{ env.CCACHE_MAXSIZE }}
+              touch "$INIT_FLAG"
+              echo "✅ ccache 初始化完成"
+            else
+              echo "✅ ccache 已初始化，跳过"
+            fi
+          else
+            echo "❌ 未安装 ccache，跳过"
+          fi
+          ccache -s
+
+      - name: Install Repo Tool
+        run: |
+          curl https://storage.googleapis.com/git-repo-downloads/repo > ~/repo
+          chmod a+x ~/repo
+          sudo mv ~/repo /usr/local/bin/repo
+
+      - name: Initialize Repo and Sync
+        env:
+          FILE: ${{ github.event.inputs.FILE }}
+        run: |
+           mkdir kernel_workspace && cd kernel_workspace
+              mkdir -p .repo/manifests
+              cp "$GITHUB_WORKSPACE/.repo/manifests_fallback/${FILE}.xml" ".repo/manifests/${FILE}.xml"
+              
+              MANIFEST_REPO="OnePlusOSS"
+              MANIFEST_BRANCH="oneplus/sm8850"
+              CPU="sm8850"
+              echo "MANIFEST_REPO=$MANIFEST_REPO"
+              echo "MANIFEST_BRANCH=$MANIFEST_BRANCH"
+              
+              BASE_URL="https://github.com/${MANIFEST_REPO}/kernel_manifest.git"
+              
+              echo "使用 $MANIFEST_REPO 的分支 $MANIFEST_BRANCH 初始化仓库..."
+              repo init -u "$BASE_URL" -b "$MANIFEST_BRANCH" -m "${FILE}.xml" --depth=1 --no-clone-bundle --no-tags
+              
+              # 关键添加：替换清单文件中的错误分支名
+              sed -i 's/ks-kernel.lnx.5.0.r3-rel/oneplus\/sm8850/g' .repo/manifests/${FILE}.xml
+              
+              repo sync -c -j$(nproc) --no-clone-bundle --no-tags --force-sync
+		  run: |
+			mkdir kernel_workspace && cd kernel_workspace
+			mkdir -p .repo/manifests
+			cp "$GITHUB_WORKSPACE/.repo/manifests_fallback/${FILE}.xml" ".repo/manifests/${FILE}.xml"
+			
+			MANIFEST_REPO="OnePlusOSS"
+			MANIFEST_BRANCH="oneplus/sm8850"
+			CPU="sm8850"
+			echo "MANIFEST_REPO=$MANIFEST_REPO"
+			echo "MANIFEST_BRANCH=$MANIFEST_BRANCH"
+			
+			BASE_URL="https://github.com/${MANIFEST_REPO}/kernel_manifest.git"
+			
+			echo "使用 $MANIFEST_REPO 的分支 $MANIFEST_BRANCH 初始化仓库..."
+			repo init -u "$BASE_URL" -b "$MANIFEST_BRANCH" -m "${FILE}.xml" --depth=1 --no-clone-bundle --no-tags
+			
+			# 关键添加：替换清单文件中的错误分支名
+			sed -i 's/ks-kernel.lnx.5.0.r3-rel/oneplus\/sm8850/g' .repo/manifests/${FILE}.xml
+			
+			repo sync -c -j$(nproc) --no-clone-bundle --no-tags --force-sync
+			
+			# 后续处理...
 
           for dir in kernel_platform/common kernel_platform/msm-kernel; do
             if [ -e "$dir/BUILD.bazel" ]; then
